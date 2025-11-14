@@ -1,0 +1,439 @@
+## =========================================================
+## GSE30784 pipeline (Normal vs Dysplasia vs Cancer) + GSVA
+## =========================================================
+
+## 0) Packages
+req <- c(
+  "BiocManager","GEOquery","limma","GSVA",
+  "ggplot2","ggrepel","dplyr","stringr","tibble",
+  "pheatmap","ggstatsplot","rlang"
+)
+to_install <- req[!sapply(req, requireNamespace, quietly = TRUE)]
+if (length(to_install)) BiocManager::install(to_install, ask = FALSE, update = FALSE)
+
+suppressPackageStartupMessages({
+  library(GEOquery); library(limma); library(GSVA)
+  library(ggplot2);  library(ggrepel); library(dplyr)
+  library(stringr);  library(tibble)
+  library(pheatmap); library(ggstatsplot); library(rlang)
+})
+
+## 1) Output folder + helpers
+outdir <- "results_GSE30784"
+if (!dir.exists(outdir)) dir.create(outdir)
+
+save_plot <- function(p, filename, w = 8, h = 6, dpi = 300){
+  ggsave(file.path(outdir, filename), p, width = w, height = h, dpi = dpi)
+}
+
+make_volcano <- function(table_dgea, title, lfc_thr = 1, fdr_thr = 0.05, label_top = 15){
+  stopifnot(all(c("logFC","adj.P.Val","Symbol") %in% colnames(table_dgea)))
+  df <- table_dgea %>%
+    mutate(
+      gene_label = ifelse(!is.na(Symbol) & Symbol != "", Symbol, rownames(table_dgea)),
+      status = dplyr::case_when(
+        logFC >=  lfc_thr & adj.P.Val <= fdr_thr ~ "Upregulated",
+        logFC <= -lfc_thr & adj.P.Val <= fdr_thr ~ "Downregulated",
+        TRUE ~ "Not significant"
+      )
+    )
+  df_sig <- df %>% filter(status != "Not significant") %>% arrange(adj.P.Val)
+  df_lab <- head(df_sig, label_top)
+  
+  ggplot(df, aes(x = logFC, y = -log10(adj.P.Val), color = status)) +
+    geom_point(alpha = .75, size = 1.7) +
+    geom_vline(xintercept = c(-lfc_thr, lfc_thr), linetype = "dashed") +
+    geom_hline(yintercept = -log10(fdr_thr), linetype = "dashed") +
+    scale_color_manual(values = c("Downregulated" = "#2b8cbe",
+                                  "Upregulated"   = "#d7301f",
+                                  "Not significant" = "grey70")) +
+    geom_text_repel(data = df_lab, aes(label = gene_label),
+                    size = 3, max.overlaps = Inf, box.padding = .3) +
+    labs(title = title,
+         x = "log2 Fold Change",
+         y = "-log10(FDR)",
+         color = "Status") +
+    theme_minimal(base_size = 12)
+}
+
+collapse_by_symbol <- function(expr_mat, symbol_vec){
+  stopifnot(nrow(expr_mat) == length(symbol_vec))
+  keep   <- !is.na(symbol_vec) & symbol_vec != ""
+  expr_m <- expr_mat[keep, , drop = FALSE]
+  sym    <- symbol_vec[keep]
+  split_idx <- split(seq_len(nrow(expr_m)), sym)
+  out <- vapply(split_idx, function(ix) colMeans(expr_m[ix, , drop = FALSE]), numeric(ncol(expr_m)))
+  out <- t(out)
+  rownames(out) <- names(split_idx)
+  colnames(out) <- colnames(expr_m)
+  out
+}
+
+## 2) IFN signatures (uppercase and unique)
+IFN_Type_I <- unique(toupper(c(
+  "BST2","CXCL10","DDX58","IFI27","IFI44","IFI44L","IFI6","IFIT1","IFIT2","IFIT3",
+  "IFITM1","IFITM2","IFITM3","IRF7","IRF9","ISG15","ISG20","MX1","MX2","OAS1","OAS2","OAS3","OASL",
+  "RSAD2","SIGLEC1","STAT1","STAT2","USP18","XAF1","ZBP1"
+)))
+IFN_Type_II <- unique(toupper(c(
+  "CIITA","CXCL10","CXCL11","CXCL9","GBP1","GBP2","GBP4","GBP5",
+  "HLA-DPA1","HLA-DPB1","HLA-DQA1","HLA-DQB1","HLA-DRA","HLA-DRB1",
+  "ICAM1","IDO1","IFNG","IRF1","IRF2","IRF5","IRF8","JAK1","JAK2",
+  "PSMB8","PSMB9","SOCS1","SOCS3","STAT1","TAP1","TAP2"
+)))
+IFN_Type_III <- unique(toupper(c(
+  "IFIT1","IFIT2","IFIT3","IFITM1","IFITM2","IFITM3","IFNL1","IFNL2","IFNL3","IFNLR1","IL10RB",
+  "IRF9","ISG15","MX1","MX2","OAS1","OAS2","OAS3","STAT1","STAT2"
+)))
+genes_ifn <- list(IFN_Type_I = IFN_Type_I,
+                  IFN_Type_II = IFN_Type_II,
+                  IFN_Type_III = IFN_Type_III)
+
+## 3) Download and prepare GSE30784
+message(">> Downloading GSE30784...")
+gse  <- getGEO("GSE30784", GSEMatrix = TRUE)
+eset <- gse[[1]]
+expr <- exprs(eset)                 # probes x samples (normalized/log2)
+ph   <- pData(eset)
+fd   <- fData(eset)
+
+## Lesion (Normal / Dysplasia / Cancer)
+char_cols <- grep("^characteristics", colnames(ph), value = TRUE)
+txt <- apply(ph[, char_cols, drop = FALSE], 1, function(x) paste(x, collapse = "; "))
+Lesion <- rep(NA_character_, nrow(ph))
+Lesion[grepl("normal|control", txt, ignore.case = TRUE)]      <- "Normal"
+Lesion[grepl("dyspla", txt, ignore.case = TRUE)]              <- "Dysplasia"
+Lesion[grepl("cancer|tumou?r|oscc", txt, ignore.case = TRUE)] <- "Cancer"
+ph$Lesion <- factor(Lesion, levels = c("Normal","Dysplasia","Cancer"))
+
+## --- Ensure expr is a 2D matrix and has names ---
+## --- Robust extraction and alignment from ExpressionSet ---
+# If getGEO returned a list, keep the ExpressionSet
+if (is.list(gse) && length(gse) > 0 && inherits(gse[[1]], "ExpressionSet")) {
+  eset <- gse[[1]]
+}
+stopifnot(inherits(eset, "ExpressionSet"))
+
+# Extract matrices/tables from Biobase
+expr <- Biobase::exprs(eset)   # must be NUMERIC
+ph   <- Biobase::pData(eset)
+fd   <- Biobase::fData(eset)
+
+# Ensure type and shape (2D)
+if (!is.matrix(expr)) expr <- as.matrix(expr)
+storage.mode(expr) <- "double"
+
+# Ensure names (if missing)
+if (is.null(colnames(expr))) colnames(expr) <- Biobase::sampleNames(eset)
+if (is.null(rownames(expr))) rownames(expr) <- Biobase::featureNames(eset)
+if (is.null(rownames(ph)))   rownames(ph)   <- Biobase::sampleNames(eset)
+
+## ===== ROBUST PATCH: derive Lesion and align expr ↔ ph =====
+
+# 1) Ensure matrix and names
+expr <- Biobase::exprs(eset)
+if (!is.matrix(expr)) expr <- as.matrix(expr)
+storage.mode(expr) <- "double"
+if (is.null(colnames(expr))) colnames(expr) <- Biobase::sampleNames(eset)
+if (is.null(rownames(expr))) rownames(expr) <- Biobase::featureNames(eset)
+if (is.null(rownames(ph)))   rownames(ph)   <- Biobase::sampleNames(eset)
+
+# 2) Build a single text field per sample with ALL informative columns
+info_cols <- grep("characteristics|source_name_ch1|title|description|status|group",
+                  colnames(ph), ignore.case = TRUE, value = TRUE)
+if (length(info_cols) == 0) info_cols <- colnames(ph)  # fallback
+txt <- apply(ph[, info_cols, drop = FALSE], 1, function(x) {
+  x <- as.character(x); x <- x[!is.na(x) & x != ""]
+  tolower(paste(x, collapse = " ; "))
+})
+
+# 3) Robust Lesion derivation (Normal / Dysplasia / Cancer)
+Lesion <- rep(NA_character_, length(txt))
+
+# Normal: typical variants in GSE30784
+is_normal <- grepl("normal|control|healthy|oral mucosa|non[- ]?tumou?r",
+                   txt, ignore.case = TRUE)
+
+# Dysplasia: includes common abbreviations/misspellings
+is_dyspl  <- grepl("dyspla|displa|leukoplakia",
+                   txt, ignore.case = TRUE)
+
+# Cancer/OSCC: variants
+is_cancer <- grepl("cancer|tumou?r|oscc|carcinoma|squamous",
+                   txt, ignore.case = TRUE)
+
+Lesion[is_normal] <- "Normal"
+Lesion[is_dyspl & is.na(Lesion)]  <- "Dysplasia"
+Lesion[is_cancer & is.na(Lesion)] <- "Cancer"
+
+ph$Lesion <- factor(Lesion, levels = c("Normal","Dysplasia","Cancer"))
+
+message("Provisional Lesion summary (before filtering):")
+print(table(ph$Lesion, useNA = "ifany"))
+
+# 4) Filter samples with valid labels and ALIGN by common names
+keep <- !is.na(ph$Lesion)
+ph_f <- ph[keep, , drop = FALSE]
+
+# Safe intersection by names (GSM...)
+common <- intersect(colnames(expr), rownames(ph_f))
+
+# Diagnostics if there are too few matches
+if (length(common) < 2) {
+  message(">> Sample name diagnostics:")
+  message("  Example colnames(expr): ", paste(utils::head(colnames(expr), 5), collapse = ", "))
+  message("  Example rownames(ph_f): ", paste(utils::head(rownames(ph_f), 5), collapse = ", "))
+  stop("There are < 2 samples in common between expr and ph after filtering by Lesion.\n",
+       "Possible causes: (1) 'Lesion' patterns did not match your labels; ",
+       "(2) rownames(ph) are not GSM IDs; (3) expr does not contain correct colnames.")
+}
+
+# Reorder and assign final objects
+expr <- expr[, common, drop = FALSE]
+ph   <- ph_f[common, , drop = FALSE]
+stopifnot(all(colnames(expr) == rownames(ph)))
+
+message("Aligned dim(expr): ", paste(dim(expr), collapse = " x "))
+message("Final Lesion table:")
+print(table(ph$Lesion))
+## ===== END ROBUST PATCH =====
+
+
+## --- Filter and align by common names (avoid dimension errors) ---
+keep <- !is.na(ph$Lesion)
+ph_f <- ph[keep, , drop = FALSE]
+
+common <- intersect(colnames(expr), rownames(ph_f))
+stopifnot(length(common) >= 2)   # need ≥ 2 samples for limma/ggstats
+expr <- expr[, common, drop = FALSE]
+ph   <- ph_f[common, , drop = FALSE]
+
+# Final check
+stopifnot(all(colnames(expr) == rownames(ph)))
+
+
+## --- Align again by safe intersection (extra guard) ---
+common <- intersect(colnames(expr), rownames(ph))
+stopifnot(length(common) >= 2)   # need ≥ 2 samples
+expr <- expr[, common, drop = FALSE]
+ph   <- ph[common, , drop = FALSE]
+
+## Final check
+stopifnot(all(colnames(expr) == rownames(ph)))
+
+
+## 4) Take HUGO directly from 'gene symbol' in fData
+##    (robust to upper/lower case and spaces)
+col_candidates <- colnames(fd)
+sym_col_idx <- which(grepl("^\\s*gene\\s*symbol\\s*$",
+                           col_candidates, ignore.case = TRUE))
+if (length(sym_col_idx) == 0){
+  stop("No 'gene symbol' (or equivalent) column was found in fData(GSE30784).")
+}
+sym_col <- col_candidates[sym_col_idx[1]]
+
+## Align fData with expr
+fd <- fd[match(rownames(expr), rownames(fd)), , drop = FALSE]
+stopifnot(all(rownames(expr) == rownames(fd)))
+
+Symbol <- toupper(trimws(fd[[sym_col]]))
+Symbol[Symbol %in% c("", NA)] <- NA_character_
+
+## 5) Collapse probes → gene using that Symbol
+expr_gene <- collapse_by_symbol(expr, Symbol)
+write.csv(
+  data.frame(ProbeID = rownames(expr), Symbol = Symbol),
+  file.path(outdir, "GSE30784_probe_to_HUGO_from_gene_symbol.csv"),
+  row.names = FALSE
+)
+message("Gene-level dim (GSE30784): ", paste(dim(expr_gene), collapse = " x "))
+
+## 6) limma (CvsN, DvsN, CvsD) at gene level
+group  <- ph$Lesion
+design <- model.matrix(~ 0 + group)
+colnames(design) <- levels(group)
+
+fitg  <- lmFit(expr_gene, design)
+contg <- makeContrasts(
+  CvsN = Cancer   - Normal,
+  DvsN = Dysplasia - Normal,
+  CvsD = Cancer   - Dysplasia,
+  levels = design
+)
+fitg2 <- eBayes(contrasts.fit(fitg, contg))
+
+tt_CvsN <- topTable(fitg2, coef = "CvsN", number = Inf, sort.by = "P")
+tt_DvsN <- topTable(fitg2, coef = "DvsN", number = Inf, sort.by = "P")
+tt_CvsD <- topTable(fitg2, coef = "CvsD", number = Inf, sort.by = "P")
+
+res_CvsN <- tt_CvsN %>% rownames_to_column("Symbol")
+res_DvsN <- tt_DvsN %>% rownames_to_column("Symbol")
+res_CvsD <- tt_CvsD %>% rownames_to_column("Symbol")
+
+write.csv(res_CvsN, file.path(outdir, "DGEA_GSE30784_Cancer_vs_Normal_genes.csv"),   row.names = FALSE)
+write.csv(res_DvsN, file.path(outdir, "DGEA_GSE30784_Dysplasia_vs_Normal_genes.csv"), row.names = FALSE)
+write.csv(res_CvsD, file.path(outdir, "DGEA_GSE30784_Cancer_vs_Dysplasia_genes.csv"), row.names = FALSE)
+
+## 7) VOLCANOS (one per contrast)
+stopifnot(all(c("logFC","adj.P.Val","Symbol") %in% colnames(res_CvsN)))
+stopifnot(all(c("logFC","adj.P.Val","Symbol") %in% colnames(res_DvsN)))
+stopifnot(all(c("logFC","adj.P.Val","Symbol") %in% colnames(res_CvsD)))
+
+p_CN <- make_volcano(res_CvsN, "Volcano: Cancer vs Normal (GSE30784)")
+p_DN <- make_volcano(res_DvsN, "Volcano: Dysplasia vs Normal (GSE30784)")
+p_CD <- make_volcano(res_CvsD, "Volcano: Cancer vs Dysplasia (GSE30784)")
+
+save_plot(p_CN, "volcano_GSE30784_Cancer_vs_Normal.png",   w = 8, h = 6)
+save_plot(p_DN, "volcano_GSE30784_Dysplasia_vs_Normal.png", w = 8, h = 6)
+save_plot(p_CD, "volcano_GSE30784_Cancer_vs_Dysplasia.png", w = 8, h = 6)
+
+## 8) HEATMAP (Top 50 by minimum FDR across the 3 comparisons)
+fx <- data.frame(
+  gene      = rownames(expr_gene),
+  FDR_CvsN  = tt_CvsN[rownames(expr_gene), "adj.P.Val"],
+  FDR_DvsN  = tt_DvsN[rownames(expr_gene), "adj.P.Val"],
+  FDR_CvsD  = tt_CvsD[rownames(expr_gene), "adj.P.Val"]
+)
+fx$FDR_min <- apply(fx[, c("FDR_CvsN","FDR_DvsN","FDR_CvsD")], 1, min, na.rm = TRUE)
+
+top_n <- 50
+top_genes <- fx %>%
+  arrange(FDR_min) %>%
+  slice(1:top_n) %>%
+  pull(gene)
+
+mat_top <- expr_gene[intersect(rownames(expr_gene), top_genes), , drop = FALSE]
+mat_z   <- t(scale(t(mat_top)))
+mat_z   <- mat_z[complete.cases(mat_z), , drop = FALSE]
+
+ann_col <- data.frame(Lesion = ph$Lesion); rownames(ann_col) <- rownames(ph)
+
+pheatmap(
+  mat_z,
+  annotation_col = ann_col,
+  show_rownames  = TRUE,
+  show_colnames  = FALSE,
+  color = colorRampPalette(c("navy","white","firebrick3"))(100),
+  clustering_distance_rows = "euclidean",
+  clustering_distance_cols = "euclidean",
+  clustering_method        = "complete",
+  main = sprintf("GSE30784 • Heatmap (Top %d genes by minimum FDR)", nrow(mat_z)),
+  border_color = NA,
+  filename = file.path(outdir, sprintf("heatmap_GSE30784_top%d_genes.png", nrow(mat_z))),
+  width = 10, height = 8
+)
+
+## 9) GSVA (API-compatible)
+expr_gene <- as.matrix(expr_gene)
+storage.mode(expr_gene) <- "double"
+
+available <- rownames(expr_gene)
+genes_ifn_filtered <- lapply(genes_ifn, function(v) intersect(unique(toupper(v)), available))
+stopifnot(length(genes_ifn_filtered) > 0, nrow(expr_gene) > 0, ncol(expr_gene) > 1)
+
+.has_export <- function(pkg, sym) sym %in% getNamespaceExports(pkg)
+
+S <- NULL
+if (.has_export("GSVA", "GSVAParam")) {
+  params <- GSVA::GSVAParam(
+    expr     = expr_gene,
+    geneSets = genes_ifn_filtered,
+    kcdf     = "Gaussian",
+    minSize  = 5,
+    maxSize  = Inf
+  )
+  S <- GSVA::gsva(params)
+  
+} else if (.has_export("GSVA", "gsvaParam")) {
+  params <- GSVA::gsvaParam(
+    expr     = expr_gene,
+    geneSets = genes_ifn_filtered,
+    kcdf     = "Gaussian",
+    minSize  = 5,
+    maxSize  = Inf
+  )
+  S <- GSVA::gsva(params)
+  
+} else {
+  S <- GSVA::gsva(
+    expr          = expr_gene,
+    gset.idx.list = genes_ifn_filtered,
+    method        = "gsva",
+    kcdf          = "Gaussian",
+    min.sz        = 5,
+    max.sz        = Inf
+  )
+}
+
+stopifnot(is.matrix(S))
+write.csv(S, file.path(outdir, "GSVA_scores_IFN_GSE30784.csv"))
+
+## 10) ggbetweenstats-type plots (three groups) — COMPLETE REPLACEMENT
+## (make sure library(rlang) and library(ggstatsplot) are loaded above)
+
+## Build df_scores if it does not exist
+if (!exists("df_scores")) {
+  df_scores <- as.data.frame(t(S)) %>%
+    tibble::rownames_to_column("Sample") %>%
+    dplyr::left_join(
+      tibble::tibble(Sample = rownames(ph), Lesion = ph$Lesion),
+      by = "Sample"
+    )
+}
+## Clean factor
+df_scores$Lesion <- droplevels(as.factor(df_scores$Lesion))
+
+## Tidy-eval compatible function
+plot_gsva_between <- function(df, signature, xlab = "Lesion", title_prefix = "GSVA – ") {
+  stopifnot(signature %in% colnames(df))
+  yvar <- rlang::sym(signature)  # string -> symbol
+  ggstatsplot::ggbetweenstats(
+    data  = df,
+    x     = Lesion,            # 3 levels: Normal, Dysplasia, Cancer
+    y     = !!yvar,
+    mean.ci = TRUE,
+    pairwise.comparisons = TRUE,
+    pairwise.display      = "significant",
+    messages              = FALSE
+  ) +
+    labs(
+      title = paste0(title_prefix, signature, " (Normal vs Dysplasia vs Cancer)"),
+      x     = "",
+      y     = "GSVA score"
+    ) +
+    theme_minimal(base_size = 12)
+}
+
+## Generate and save one figure per signature (IFN_Type_I / II / III)
+for (f in names(genes_ifn_filtered)) {
+  p <- plot_gsva_between(df_scores, f)
+  save_plot(p, paste0("GSVA_", f, "_ggbetweenstats.png"), w = 9, h = 7, dpi = 320)
+}
+
+## 11) DEG summaries per contrast
+lfc_thr <- 1
+fdr_thr <- 0.05
+
+count_degs <- function(df){
+  df %>%
+    mutate(
+      status = dplyr::case_when(
+        logFC >=  lfc_thr & adj.P.Val <= fdr_thr ~ "Upregulated",
+        logFC <= -lfc_thr & adj.P.Val <= fdr_thr ~ "Downregulated",
+        TRUE ~ "Not significant"
+      )
+    ) %>%
+    count(status)
+}
+
+write.csv(count_degs(res_CvsN),
+          file.path(outdir, "DGEA_GSE30784_summary_counts_CvsN.csv"),
+          row.names = FALSE)
+write.csv(count_degs(res_DvsN),
+          file.path(outdir, "DGEA_GSE30784_summary_counts_DvsN.csv"),
+          row.names = FALSE)
+write.csv(count_degs(res_CvsD),
+          file.path(outdir, "DGEA_GSE30784_summary_counts_CvsD.csv"),
+          row.names = FALSE)
+
+message("Done. Files written to: ", normalizePath(outdir))
