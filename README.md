@@ -158,24 +158,24 @@ process_gse_phase3("GSE25099")
 # (Optional) The dedicated section for GSE30784 is executed automatically
 # if you run the full script top-to-bottom.
 
-# 5. Reproducibilitty
+5. Reproducibilitty
 set.seed(123)
 
-# 6. Citation
+6. Citation
 
-# If you use this code or derivative pipelines in your work, please cite: The GEO datasets:
-# GSE30784 – Oral mucosa progression (Normal / Dysplasia / Cancer)
-# GSE25099 – Complementary oral lesion dataset (Normal / Dysplasia / Cancer)
-# The analytical tools:
-# Love MI et al., Genome Biol, 2014 (DESeq2)
-# Ritchie ME et al., Nucleic Acids Res, 2015 (limma)
-# Hänzelmann S et al., BMC Bioinformatics, 2013 (GSVA)
-# and any relevant Bioconductor annotation packages.
+If you use this code or derivative pipelines in your work, please cite: The GEO datasets:
+GSE30784 – Oral mucosa progression (Normal / Dysplasia / Cancer)
+GSE25099 – Complementary oral lesion dataset (Normal / Dysplasia / Cancer)
+The analytical tools:
+Love MI et al., Genome Biol, 2014 (DESeq2)
+Ritchie ME et al., Nucleic Acids Res, 2015 (limma)
+Hänzelmann S et al., BMC Bioinformatics, 2013 (GSVA)
+and any relevant Bioconductor annotation packages.
 
-# 7. Contact
-# For questions, suggestions, or bug reports, please open an Issue in this repository or contact:
-# Fernán Gómez Valenzuela
-# Cancer & Chronic Inflammation (CCI) Lab
-# Center for Precision Oncology
-# fernan.gomez@umayor.cl
-# https://orcid.org/0000-0001-6889-976X
+7. Contact
+For questions, suggestions, or bug reports, please open an Issue in this repository or contact:
+Fernán Gómez Valenzuela
+Cancer & Chronic Inflammation (CCI) Lab
+Center for Precision Oncology
+fernan.gomez@umayor.cl
+https://orcid.org/0000-0001-6889-976X
