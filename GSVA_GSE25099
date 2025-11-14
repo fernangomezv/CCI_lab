@@ -1,0 +1,387 @@
+# =========================================================
+# PHASE 3 (GEO): Normal / Dysplasia / Cancer Progression
+# - Download GSE30784 and GSE25099
+# - DGE per pair (CvsN, DvsN, CvsD)
+# - GSVA (IFN I/II/III) with collapse to gene or mapping to ILMN
+# - Figures (including robust PCA) and Excel per dataset
+# =========================================================
+
+# --- Packages ---
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+bioc_needed <- c("GEOquery","DESeq2","limma","GSVA","apeglm","Biobase",
+                 "AnnotationDbi","illuminaHumanv3.db","illuminaHumanv2.db","illuminaHumanv4.db")
+for (pkg in bioc_needed) if (!requireNamespace(pkg, quietly = TRUE)) BiocManager::install(pkg, ask = FALSE, update = FALSE)
+cran_needed <- c("tidyverse","openxlsx","pheatmap","RColorBrewer","ggplot2","ggrepel","ggstatsplot")
+for (pkg in cran_needed) if (!requireNamespace(pkg, quietly = TRUE)) install.packages(pkg)
+
+suppressPackageStartupMessages({
+  library(GEOquery); library(DESeq2); library(limma); library(GSVA); library(apeglm); library(Biobase)
+  library(AnnotationDbi); library(illuminaHumanv3.db); library(illuminaHumanv2.db); library(illuminaHumanv4.db)
+  library(tidyverse); library(openxlsx); library(pheatmap); library(RColorBrewer)
+  library(ggplot2); library(ggrepel); library(ggstatsplot)
+})
+
+set.seed(123)
+
+# --- IFN signatures ---
+IFN_Type_I <- unique(c(
+  "BST2","CXCL10","DDX58","IFI27","IFI44","IFI44L","IFI6",
+  "IFIT1","IFIT2","IFIT3","IFITM1","IFITM2","IFITM3",
+  "IRF7","IRF9","ISG15","ISG20","MX1","MX2","OAS1","OAS2","OAS3","OASL",
+  "RSAD2","SIGLEC1","STAT1","STAT2","USP18","XAF1","ZBP1"
+))
+IFN_Type_II <- unique(c(
+  "CIITA","CXCL10","CXCL11","CXCL9","GBP1","GBP2","GBP4","GBP5",
+  "HLA-DPA1","HLA-DPB1","HLA-DQA1","HLA-DQB1","HLA-DRA","HLA-DRB1",
+  "ICAM1","IDO1","IFNG","IRF1","IRF2","IRF5","IRF8","JAK1","JAK2",
+  "PSMB8","PSMB9","SOCS1","SOCS3","STAT1","TAP1","TAP2"
+))
+IFN_Type_III <- unique(c(
+  "IFIT1","IFIT2","IFIT3","IFITM1","IFITM2","IFITM3",
+  "IFNL1","IFNL2","IFNL3","IFNLR1","IL10RB","IRF9",
+  "ISG15","MX1","MX2","OAS1","OAS2","OAS3","STAT1","STAT2"
+))
+IFNsets <- list(IFN_Type_I=IFN_Type_I, IFN_Type_II=IFN_Type_II, IFN_Type_III=IFN_Type_III)
+IFN_all <- unique(unlist(IFNsets))
+
+# --- Label helpers ---
+normalize_labels_lesion <- function(x){
+  x <- as.character(x)
+  dplyr::case_when(
+    grepl("normal|healthy|control|adjacent|non[- ]?tumou?r|benign|mucosa", x, TRUE) ~ "Normal",
+    grepl("dyspla|displa|leukoplakia|premalign", x, TRUE) ~ "Dysplasia",
+    grepl("cancer|tumou?r|malignan|carcinoma|scc", x, TRUE) ~ "Cancer",
+    TRUE ~ NA_character_
+  )
+}
+guess_lesion_col <- function(meta_df){
+  hits <- names(meta_df)[apply(meta_df, 2, function(v) any(grepl("normal|dyspla|displa|cancer|tumou|malignan|control|adjacent|non[- ]?tumou?r|mucosa|benign|carcinoma|scc", v, TRUE)))]
+  if (length(hits) == 0) return(NULL)
+  hits[1]
+}
+is_count_like <- function(m){
+  all(abs(m - round(m)) < 1e-6, na.rm = TRUE) && max(m, na.rm = TRUE) > 100
+}
+
+# --- Mapping ILMN <-> SYMBOL and collapse to gene ---
+get_probe_symbol_map_from_bioc <- function(probe_ids){
+  pkgs <- c("illuminaHumanv3.db","illuminaHumanv2.db","illuminaHumanv4.db")
+  for (p in pkgs) {
+    if (!requireNamespace(p, quietly = TRUE)) next
+    suppressPackageStartupMessages(library(p, character.only = TRUE))
+    kt <- AnnotationDbi::keytypes(get(p))
+    try_keys <- intersect(c("ILMNID","PROBEID","ARRAYADDRESS","PROBE_ID","ID"), kt)
+    if (length(try_keys) == 0) next
+    for (k in try_keys) {
+      m <- tryCatch(AnnotationDbi::select(get(p), keys = probe_ids, keytype = k, columns = c("SYMBOL")), error = function(e) NULL)
+      if (is.null(m)) next
+      m <- unique(m[!is.na(m$SYMBOL) & m$SYMBOL != "", , drop = FALSE])
+      if (nrow(m) > 0) {
+        colnames(m)[1] <- "probe_id"; colnames(m)[colnames(m)=="SYMBOL"] <- "Symbol"
+        return(m[, c("probe_id","Symbol"), drop = FALSE])
+      }
+    }
+  }
+  NULL
+}
+get_probe_symbol_map <- function(fdat, platform, probe_ids){
+  # A) fData
+  sym_cols <- grep("symbol|gene.symbol|gene_symbol|Gene Symbol|SYMBOL|GeneSymbol", colnames(fdat), TRUE, value = TRUE)
+  id_cols  <- grep("^ID$|^ID_REF$|Probe|ILMN|PROBE", colnames(fdat), TRUE, value = TRUE)
+  if (length(sym_cols) > 0 && length(id_cols) > 0) {
+    df <- fdat[, c(id_cols[1], sym_cols[1])]
+    colnames(df) <- c("probe_id","Symbol")
+    df$Symbol <- ifelse(is.na(df$Symbol) | df$Symbol=="", NA, df$Symbol)
+    df <- unique(df[!is.na(df$Symbol) & df$Symbol!="", , drop = FALSE])
+    if (nrow(df) > 0) return(df)
+  }
+  # B) GPL
+  message("Trying to retrieve platform annotation: ", platform)
+  gpl <- tryCatch(GEOquery::getGEO(platform, AnnotGPL = TRUE), error = function(e) NULL)
+  if (!is.null(gpl)) {
+    tbl <- tryCatch(Table(gpl), error = function(e) NULL)
+    if (!is.null(tbl)) {
+      sym_cols_gpl <- intersect(c("Gene Symbol","Symbol","SYMBOL","GENE_SYMBOL","GeneSymbol"), colnames(tbl))
+      id_cols_gpl  <- intersect(c("ID","ID_REF","Probe ID","ILMN_ID","ProbeID","PROBE_ID"), colnames(tbl))
+      if (length(sym_cols_gpl) > 0 && length(id_cols_gpl) > 0) {
+        df <- tbl[, c(id_cols_gpl[1], sym_cols_gpl[1])]
+        colnames(df) <- c("probe_id","Symbol")
+        df$Symbol <- ifelse(is.na(df$Symbol) | df$Symbol=="", NA, df$Symbol)
+        df <- unique(df[!is.na(df$Symbol) & df$Symbol!="", , drop = FALSE])
+        if (nrow(df) > 0) return(df)
+      }
+    }
+  }
+  # C) Bioconductor
+  get_probe_symbol_map_from_bioc(probe_ids)
+}
+collapse_to_gene_median <- function(expr_mat, fdat, platform){
+  probe_ids <- rownames(expr_mat)
+  map_df <- get_probe_symbol_map(fdat, platform, probe_ids)
+  if (is.null(map_df)) return(NULL)
+  common <- intersect(rownames(expr_mat), map_df$probe_id)
+  if (length(common) < 10) return(NULL)
+  map_df <- map_df[match(common, map_df$probe_id), , drop = FALSE]
+  expr_use <- expr_mat[common, , drop = FALSE]
+  sym <- map_df$Symbol
+  split_idx <- split(seq_len(nrow(expr_use)), sym)
+  collapsed <- lapply(split_idx, function(ix) apply(expr_use[ix, , drop = FALSE], 2, median, na.rm = TRUE))
+  collapsed <- do.call(rbind, collapsed)
+  rownames(collapsed) <- names(split_idx)
+  collapsed
+}
+
+# --- GSVA compat ---
+gsva_compat <- function(expr_matrix, gene_sets){
+  gene_sets <- lapply(gene_sets, function(g) intersect(g, rownames(expr_matrix)))
+  gene_sets <- gene_sets[sapply(gene_sets, length) >= 3]
+  if (length(gene_sets) == 0) stop("IFN gene sets are empty for this dataset.")
+  use_new_api <- "gsvaParam" %in% getNamespaceExports("GSVA")
+  if (use_new_api) {
+    param <- GSVA::gsvaParam(exprData=expr_matrix, geneSets=gene_sets,
+                             kcdf="Gaussian", minSize=3, maxSize=500, absRanking=FALSE)
+    GSVA::gsva(param)
+  } else {
+    GSVA::gsva(expr_matrix, gene_sets, method="gsva", kcdf="Gaussian",
+               min.sz=3, max.sz=500, abs.ranking=FALSE, verbose=FALSE)
+  }
+}
+
+# --- Figures ---
+plot_volcano <- function(tab, name, out_dir){
+  df <- tab %>% dplyr::mutate(Signif = adj.P.Val < 0.05 & abs(logFC) >= 1)
+  p <- ggplot(df, aes(x=logFC, y=-log10(adj.P.Val), color=Signif)) +
+    geom_point(alpha = 0.7, size=1.2) +
+    scale_color_manual(values = c("FALSE"="grey70","TRUE"="firebrick")) +
+    geom_vline(xintercept = c(-1,1), linetype="dashed") +
+    geom_hline(yintercept = -log10(0.05), linetype="dashed") +
+    labs(title = paste("Volcano", name), x="log2FC", y="-log10(FDR)") +
+    theme_minimal(12)
+  ggsave(file.path(out_dir, paste0("Volcano_", name, ".png")), p, width=8, height=6, dpi=300)
+}
+mk_heat <- function(expr_mat, groups, top_features, title, out_dir){
+  topf <- intersect(top_features, rownames(expr_mat))
+  if (length(topf) < 2) return(invisible(NULL))
+  mat <- expr_mat[topf, , drop = FALSE]
+  mat <- t(scale(t(mat)))
+  ann <- data.frame(Lesion = groups); rownames(ann) <- colnames(expr_mat)
+  png(file.path(out_dir, paste0("Heatmap_Top_", gsub(" ", "_", title), ".png")), width=1600, height=1400, res=200)
+  pheatmap(mat, annotation_col = ann, show_rownames = TRUE, main = title)
+  dev.off()
+}
+pca_plot <- function(expr_mat, groups, title, out){
+  # --- PATCH: remove near-zero variance samples to avoid prcomp error ---
+  sds <- apply(expr_mat, 2, sd, na.rm = TRUE)
+  keep <- which(is.finite(sds) & sds > 1e-8)
+  expr_use <- expr_mat[, keep, drop = FALSE]
+  groups_use <- groups[keep]
+  if (ncol(expr_use) < 3) return(invisible(NULL))
+  pc <- prcomp(t(expr_use), scale. = TRUE)
+  pct <- round(100 * (pc$sdev^2 / sum(pc$sdev^2))[1:2], 1)
+  df <- data.frame(pc$x[,1:2], Lesion = groups_use, sample_id = colnames(expr_use))
+  p <- ggplot(df, aes(PC1, PC2, color=Lesion)) +
+    geom_point(size=3, alpha=.85) +
+    labs(title=title, x=paste0("PC1 (", pct[1], "%)"), y=paste0("PC2 (", pct[2], "%)")) +
+    theme_minimal(12)
+  ggsave(out, p, width=8, height=6, dpi=300)
+}
+
+# --- Pipeline for a single ExpressionSet ---
+process_one_eset_phase3 <- function(eset, gseid, idx){
+  platform <- annotation(eset)
+  out_dir <- file.path(getwd(), paste0("RESULTS_", gseid))
+  dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+  suffix <- paste0(gseid, "_", platform, "_set", idx)
+  
+  expr <- Biobase::exprs(eset)        # features x samples
+  meta <- as.data.frame(Biobase::pData(eset)) %>% tibble::rownames_to_column("sample_id")
+  
+  # Lesion
+  les_col <- guess_lesion_col(meta)
+  if (is.null(les_col)) { 
+    warning(suffix, ": no lesion-like column found; skipping this set.") 
+    return(invisible(NULL)) 
+  }
+  meta <- meta %>% mutate(Lesion = normalize_labels_lesion(.data[[les_col]])) %>% filter(!is.na(Lesion))
+  
+  # Align
+  common <- intersect(colnames(expr), meta$sample_id)
+  expr <- expr[, common, drop = FALSE]
+  meta  <- meta[match(common, meta$sample_id), , drop = FALSE]
+  stopifnot(all(colnames(expr) == meta$sample_id))
+  
+  # Levels
+  meta$Lesion <- factor(meta$Lesion, levels = c("Normal","Dysplasia","Cancer"))
+  meta$Lesion <- droplevels(meta$Lesion)
+  present <- levels(meta$Lesion)
+  message(suffix, " | Counts: ", paste(paste0(present, "=", table(meta$Lesion)), collapse=" | "))
+  
+  # Preprocessing according to data type
+  is_counts <- is_count_like(expr)
+  gsva_expr <- NULL
+  de_tabs <- list()
+  
+  if (is_counts) {
+    # ---------- RNA-seq → DESeq2 ----------
+    message(suffix, " | detected as RNA-seq (counts) → DESeq2")
+    keep <- rowSums(expr >= 10) >= ceiling(0.2 * ncol(expr))
+    expr <- expr[keep, , drop = FALSE]
+    dds <- DESeqDataSetFromMatrix(round(expr),
+                                  colData = data.frame(Lesion = meta$Lesion, row.names = meta$sample_id),
+                                  design = ~ Lesion)
+    dds <- DESeq(dds)
+    vsd <- vst(dds, blind = TRUE)
+    gsva_expr <- assay(vsd)
+    
+    tbl <- table(meta$Lesion); have2 <- names(tbl)[tbl >= 2]
+    if (all(c("Cancer","Normal") %in% have2)) de_tabs$DESeq2_CvsN <- results(dds, contrast=c("Lesion","Cancer","Normal")) %>% as.data.frame() %>% tibble::rownames_to_column("gene") %>% filter(!is.na(padj)) %>% arrange(padj)
+    if (all(c("Dysplasia","Normal") %in% have2)) de_tabs$DESeq2_DvsN <- results(dds, contrast=c("Lesion","Dysplasia","Normal")) %>% as.data.frame() %>% tibble::rownames_to_column("gene") %>% filter(!is.na(padj)) %>% arrange(padj)
+    if (all(c("Cancer","Dysplasia") %in% have2)) de_tabs$DESeq2_CvsD <- results(dds, contrast=c("Lesion","Cancer","Dysplasia")) %>% as.data.frame() %>% tibble::rownames_to_column("gene") %>% filter(!is.na(padj)) %>% arrange(padj)
+    
+    # PCA / Heatmap
+    if (!is.null(gsva_expr)) {
+      pca_plot(gsva_expr, meta$Lesion, paste0(suffix, " - PCA (VST)"), file.path(out_dir, paste0("PCA_", suffix, "_VST.png")))
+      if (length(de_tabs) > 0) {
+        top50 <- head(de_tabs[[1]]$gene, 50); mk_heat(gsva_expr, meta$Lesion, top50, paste0("Top50 (", names(de_tabs)[1], ")"), out_dir)
+      }
+    }
+    
+  } else {
+    # ---------- Microarray → limma ----------
+    message(suffix, " | detected as microarray (intensities) → limma")
+    rng <- range(expr, na.rm = TRUE)
+    if (rng[2] > 100) expr <- log2(expr + 1)
+    expr <- normalizeBetweenArrays(expr, method = "quantile")
+    
+    # --- Attempt 1: collapse to gene ---
+    fdat <- Biobase::fData(eset)
+    expr_gene <- tryCatch(collapse_to_gene_median(expr, fdat, platform), error=function(e) NULL)
+    if (!is.null(expr_gene)) {
+      gsva_expr <- expr_gene  # gene symbols in rows
+    } else {
+      # --- Attempt 2: GSVA at PROBE-level (convert IFN signatures to ILMN) ---
+      probe_map <- tryCatch(get_probe_symbol_map(fdat, platform, rownames(expr)), error=function(e) NULL)
+      if (!is.null(probe_map)) {
+        # build probe lists per IFN set
+        IFN_probe_sets <- lapply(IFNsets, function(symset){
+          unique(probe_map$probe_id[probe_map$Symbol %in% symset])
+        })
+        # restrict to probes present in the matrix
+        IFN_probe_sets <- lapply(IFN_probe_sets, function(v) intersect(v, rownames(expr)))
+        # remove small sets
+        IFN_probe_sets <- IFN_probe_sets[sapply(IFN_probe_sets, length) >= 3]
+        if (length(IFN_probe_sets) == 0) warning(suffix, ": could not map IFN signatures to probes; GSVA will be skipped.")
+        gsva_expr <- expr  # NOTE: if IFN_probe_sets ends up empty, we handle it below
+        attr(gsva_expr, "IFN_probe_sets") <- IFN_probe_sets
+      } else {
+        warning(suffix, ": no probe->symbol map; GSVA will be skipped.")
+        gsva_expr <- NULL
+      }
+    }
+    
+    # limma contrasts (if ≥ 2 samples per group)
+    les <- meta$Lesion
+    design <- model.matrix(~ 0 + les); colnames(design) <- levels(les)
+    tbl <- table(les); have2 <- names(tbl)[tbl >= 2]
+    contr_list <- list()
+    if (all(c("Cancer","Normal") %in% have2)) contr_list$CvsN <- quote(Cancer - Normal)
+    if (all(c("Dysplasia","Normal") %in% have2)) contr_list$DvsN <- quote(Dysplasia - Normal)
+    if (all(c("Cancer","Dysplasia") %in% have2)) contr_list$CvsD <- quote(Cancer - Dysplasia)
+    
+    if (length(contr_list) > 0) {
+      cm <- do.call(makeContrasts, c(contr_list, list(levels = design)))
+      fit <- lmFit(expr, design) %>% contrasts.fit(cm) %>% eBayes()
+      for (cn in colnames(cm)) {
+        tt <- topTable(fit, coef = cn, number = Inf, sort.by = "P") %>% tibble::rownames_to_column("feature")
+        de_tabs[[paste0("LIMMA_", cn)]] <- tt
+        plot_volcano(tt %>% dplyr::rename(adj.P.Val = adj.P.Val, logFC = logFC), paste0(suffix, "_", cn, "_ARRAY"), out_dir)
+        mk_heat(expr, les, head(tt$feature, 50), paste0("Top50 (", cn, " - ARRAY)"), out_dir)
+      }
+    }
+    
+    # PCA (robust)
+    pca_plot(if (!is.null(expr_gene)) expr_gene else expr, les, paste0(suffix, " - PCA (ARRAY)"),
+             file.path(out_dir, paste0("PCA_", suffix, "_ARRAY.png")))
+  }
+  
+  # --------- GSVA IFN + grouped figure ---------
+  if (!is.null(gsva_expr)) {
+    if (!is.null(attr(gsva_expr, "IFN_probe_sets"))) {
+      IFN_to_use <- attr(gsva_expr, "IFN_probe_sets")
+      if (length(IFN_to_use) == 0) IFN_to_use <- NULL
+    } else {
+      IFN_to_use <- IFNsets
+    }
+  } else {
+    IFN_to_use <- NULL
+  }
+  
+  gsva_scores_df <- NULL
+  if (!is.null(IFN_to_use)) {
+    # run GSVA
+    gsva_scores <- tryCatch(
+      {
+        # if gsva_expr is gene-level → use IFNsets; if probe-level → use IFN_probe_sets
+        gsva_compat(gsva_expr, IFN_to_use)
+      },
+      error = function(e) {
+        warning(suffix, ": GSVA could not be run (", e$message, ")")
+        NULL
+      }
+    )
+    if (!is.null(gsva_scores)) {
+      gsva_scores_df <- as.data.frame(t(gsva_scores)) %>%
+        tibble::rownames_to_column("sample_id") %>%
+        left_join(meta[, c("sample_id","Lesion")], by="sample_id")
+      
+      # Grouped figure (panel per IFN set)
+      gsva_long <- gsva_scores_df %>% tidyr::pivot_longer(cols = starts_with("IFN_"), names_to = "IFN_set", values_to = "score")
+      p_gsva <- ggstatsplot::grouped_ggbetweenstats(
+        data             = gsva_long %>% dplyr::filter(!is.na(Lesion)),
+        x                = Lesion,
+        y                = score,
+        grouping.var     = IFN_set,
+        type             = "p",
+        mean.plotting    = TRUE,
+        mean.ci          = TRUE,
+        centrality.type  = "parametric",
+        xlab             = "Lesion",
+        ylab             = "GSVA Enrichment Score",
+        ggplot.component = list(ggplot2::geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.6)),
+        kggplot2.args    = list(theme = ggplot2::theme_minimal(base_size = 12))
+      )
+      ggsave(file.path(out_dir, paste0("GSVA_IFN_", suffix, "_ggstatsplot.png")), p_gsva, width=11, height=4.2, dpi=300)
+      ggsave(file.path(out_dir, paste0("GSVA_IFN_", suffix, "_ggstatsplot.pdf")), p_gsva, width=11, height=4.2)
+    }
+  } else {
+    warning(suffix, ": GSVA skipped (no valid IFN signature mapping).")
+  }
+  
+  # --------- Excel export per dataset ---------
+  wb <- list()
+  if (!is.null(gsva_scores_df)) wb$GSVA_scores_bySample <- gsva_scores_df
+  if (length(de_tabs) > 0) wb <- c(wb, de_tabs)
+  if (length(wb) == 0) wb$INFO <- data.frame(msg="No tables were available to export for this set.")
+  openxlsx::write.xlsx(wb, file = file.path(out_dir, paste0("Excel_", suffix, ".xlsx")), overwrite = TRUE)
+  message("Done: ", file.path(out_dir, paste0("Excel_", suffix, ".xlsx")))
+}
+
+process_gse_phase3 <- function(gseid){
+  message("Downloading ", gseid, " ...")
+  gs <- GEOquery::getGEO(gseid, GSEMatrix = TRUE)
+  if (is.list(gs)) {
+    for (i in seq_along(gs)) {
+      message(gseid, ": processing ExpressionSet #", i, " (platform=", annotation(gs[[i]]), ")")
+      process_one_eset_phase3(gs[[i]], gseid, i)
+    }
+  } else {
+    message(gseid, ": processing single ExpressionSet (platform=", annotation(gs), ")")
+    process_one_eset_phase3(gs, gseid, 1)
+  }
+}
+
+# === Run Phase 3 for both GEO series ===
+process_gse_phase3("GSE30784")
+process_gse_phase3("GSE25099")
+
+
