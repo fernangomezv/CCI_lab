@@ -1,0 +1,676 @@
+# ENS Chile 2016–2017 — Oral Health & Cancer History
+# Replication pipeline (R)
+#
+# Purpose:
+#   Replicate the STATA analytical workflow using a reproducible,
+#   survey-aware R pipeline (complex sampling design).
+#
+# OUTPUTS:
+#   - Table1_weighted.xlsx
+#   - Table2_LPM_unweighted_robust.xlsx
+#   - Table3_PR_svyPoisson.xlsx
+#   - Figures in OUT_DIR/figures/
+#
+# Reproducibility:
+#   - Single entry point (run top-to-bottom)
+#   - Explicit configuration block
+#   - sessionInfo() saved at the end
+
+# I. INDEX (run order) ----
+## 0) Packages + global options
+## 1) Configuration (paths + survey design variable names)
+## 2) Load data + basic checks
+## 3) Helper functions (NA recode, zscore, summary helpers, plotting)
+## 4) Derive analytic variables (outcome + oral health + covariates)
+## 5) Build SVI (income + education + poverty + housing) + standardize
+## 6) Survey design object (weights/PSU/strata) + clean design rows
+## 7) Complete-case analytic sample (consistent for core models)
+## 8) Table 1 (survey-weighted descriptive stats)
+## 9) Models
+###    9.1) Table 2: unweighted LPM with robust SE
+###   9.2) Table 3: survey-weighted Poisson PR models
+## 10) Figures
+###    10.1) Survey-weighted prevalence by groups (SVI quintiles, tooth-loss categories, diabetes)
+###    10.2) Forest plots (PR models)
+###    10.3) PR curve: cancer history vs tooth loss (weighted + unweighted)
+## 11) Optional: add ethnicity (Yes/No) to models
+## 12) Save session info
+
+# II. PACKAGES + GLOBAL OPTIONS ----
+library(haven)
+library(dplyr)
+library(forcats)
+library(stringr)
+library(survey)
+library(srvyr)
+library(broom)
+library(sandwich)
+library(lmtest)
+library(ggplot2)
+library(purrr)
+library(tidyr)
+library(openxlsx)
+library(janitor)
+
+options(survey.lonely.psu = "adjust")   # handle strata with single PSU
+
+
+# III. CONFIGURATION ----
+# Tip: Avoid setwd() when sharing. Prefer absolute paths or a project structure.
+# If you must use setwd(), keep it here so it is explicit.
+# Primary Sampling Unit (PSU)
+# setwd()
+
+DTA_PATH <- "ENS_2016_2017.dta"  # <- update if needed
+OUT_DIR  <- "outputs_oral_health_cancer"
+FIG_DIR  <- file.path(OUT_DIR, "figures")
+
+dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
+dir.create(FIG_DIR, showWarnings = FALSE, recursive = TRUE)
+
+# Survey design variable names (validated by user previously)
+W_VAR      <- "Fexp_F1F2p_Corr"
+PSU_VAR    <- "Conglomerado"
+STRATA_VAR <- "Estrato"
+
+
+# IV. LOAD DATA + BASIC CHECKS ----
+dat0 <- read_dta(DTA_PATH)
+names(dat0) <- make.names(names(dat0), unique = TRUE)
+
+cat("\nLoaded data:\n")
+print(dim(dat0))
+cat("Example variables:\n")
+print(head(names(dat0), 20))
+
+
+#V. HELPERS
+na_if_codes <- function(x, codes = c(-8888, 97, 98, 99, 997, 998, 999)) {
+  if (is.character(x)) return(x)
+  x <- as.numeric(x)
+  x[x %in% codes] <- NA
+  x
+}
+
+zscore <- function(x) {
+  x <- as.numeric(x)
+  m <- mean(x, na.rm = TRUE)
+  s <- sd(x, na.rm = TRUE)
+  if (is.na(s) || s == 0) return(rep(NA_real_, length(x)))
+  (x - m) / s
+}
+
+save_plot <- function(p, filename, width = 7, height = 5, dpi = 300) {
+  ggsave(filename = file.path(FIG_DIR, filename), plot = p,
+         width = width, height = height, dpi = dpi)
+}
+
+# Detect binary-like variables (0/1, Yes/No)
+is_binary_like <- function(x) {
+  xx <- x[!is.na(x)]
+  if (length(xx) == 0) return(FALSE)
+  if (is.logical(xx)) return(TRUE)
+  if (is.numeric(xx) || is.integer(xx)) return(all(unique(xx) %in% c(0, 1)))
+  if (is.factor(xx) || is.character(xx)) {
+    u <- unique(as.character(xx))
+    return(all(u %in% c("No","Yes","0","1")))
+  }
+  FALSE
+}
+
+# Survey-weighted prevalence by group (svyby + CI)
+weighted_prev_by <- function(des_svy, outcome_col, group_col) {
+  f_y  <- as.formula(paste0("~", outcome_col))
+  f_by <- as.formula(paste0("~", group_col))
+  
+  res <- survey::svyby(
+    formula = f_y,
+    by      = f_by,
+    design  = des_svy,
+    FUN     = survey::svymean,
+    na.rm   = TRUE,
+    vartype = c("ci"),
+    drop.empty.groups = FALSE
+  ) %>% as.data.frame()
+  
+  ci_l_col <- grep("ci_l", names(res), value = TRUE)[1]
+  ci_u_col <- grep("ci_u", names(res), value = TRUE)[1]
+  
+  out <- res %>%
+    transmute(
+      group    = .data[[group_col]],
+      prev     = .data[[outcome_col]],
+      prev_low = .data[[ci_l_col]],
+      prev_upp = .data[[ci_u_col]]
+    )
+  
+  dat_vars <- as.data.frame(des_svy$variables)
+  n_unw <- dat_vars %>%
+    filter(!is.na(.data[[group_col]])) %>%
+    count(.data[[group_col]], name = "n_unw") %>%
+    rename(group = .data[[group_col]])
+  
+  out %>% left_join(n_unw, by = "group")
+}
+
+# Survey-adjusted chi-square p-value for 2-way table
+svy_chisq_p <- function(des_svy, outcome_col, group_col) {
+  f <- as.formula(paste0("~", outcome_col, " + ", group_col))
+  
+  des_tmp <- des_svy
+  y <- des_tmp$variables[[outcome_col]]
+  des_tmp$variables[[outcome_col]] <- factor(y, levels = c(0,1), labels = c("No","Yes"))
+  
+  tryCatch({
+    test <- survey::svychisq(f, design = des_tmp, statistic = "F")
+    as.numeric(test$p.value)
+  }, error = function(e) {
+    warning("svychisq failed: ", conditionMessage(e))
+    NA_real_
+  })
+}
+
+plot_weighted_prev <- function(prev_df, title, p_value = NULL) {
+  subtitle_txt <- if (!is.null(p_value) && is.finite(p_value)) {
+    paste0("Survey-adjusted chi-square p = ", signif(p_value, 3))
+  } else NULL
+  
+  ggplot(prev_df, aes(x = group, y = prev)) +
+    geom_point() +
+    geom_errorbar(aes(ymin = prev_low, ymax = prev_upp), width = 0.15) +
+    scale_y_continuous(labels = function(x) paste0(round(100*x, 1), "%")) +
+    labs(title = title, subtitle = subtitle_txt, x = NULL,
+         y = "Weighted prevalence (95% CI)") +
+    theme_minimal()
+}
+
+plot_svyglm_pr_forest <- function(model, title) {
+  td <- broom::tidy(model, conf.int = TRUE) %>%
+    filter(term != "(Intercept)") %>%
+    mutate(
+      PR = exp(estimate),
+      PR_low = exp(conf.low),
+      PR_high = exp(conf.high),
+      term = fct_reorder(term, PR)
+    )
+  
+  ggplot(td, aes(x = PR, y = term)) +
+    geom_vline(xintercept = 1, linetype = "dashed") +
+    geom_point() +
+    geom_errorbarh(aes(xmin = PR_low, xmax = PR_high), height = 0.15) +
+    labs(title = title, x = "Prevalence Ratio (PR) with 95% CI", y = NULL) +
+    theme_minimal()
+}
+
+# PR curve vs tooth loss (weighted OR unweighted)
+plot_pr_curve <- function(beta, V, x_seq, baseline_x = min(x_seq), title, subtitle = NULL) {
+  grid <- data.frame(m5p_new = x_seq)
+  X <- model.matrix(~ m5p_new, data = grid)
+  
+  eta <- as.numeric(X %*% beta)
+  se  <- sqrt(diag(X %*% V %*% t(X)))
+  
+  # baseline at baseline_x (often 0)
+  idx0 <- which.min(abs(grid$m5p_new - baseline_x))
+  eta0 <- eta[idx0]
+  
+  grid <- grid %>%
+    mutate(
+      PR    = exp(eta - eta0),
+      PR_lo = exp((eta - 1.96*se) - eta0),
+      PR_hi = exp((eta + 1.96*se) - eta0)
+    )
+  
+  ggplot(grid, aes(x = m5p_new, y = PR)) +
+    geom_ribbon(aes(ymin = PR_lo, ymax = PR_hi), alpha = 0.2) +
+    geom_line(linewidth = 1) +
+    geom_hline(yintercept = 1, linetype = "dashed") +
+    labs(title = title, subtitle = subtitle,
+         x = "Teeth lost (m5p_new)", y = "PR (relative to baseline)") +
+    theme_minimal()
+}
+
+
+# VI. DERIVE ANALYTIC VARIABLES ----
+cancer_items <- c("m9p2A","m9p3A","m9p4A","m9p5A","m9p6A","m9p7A","m9p8A")
+
+dat <- dat0 %>%
+  mutate(
+    Edad = na_if_codes(Edad),
+    cd8  = na_if_codes(cd8),
+    
+    # Diabetes (self-report)
+    m2p6 = na_if_codes(m2p6),
+    diabetes_m2p6 = case_when(
+      m2p6 == 1 ~ 1,
+      m2p6 == 2 ~ 0,
+      TRUE ~ NA_real_
+    ),
+    
+    # Smoking status -> current smoker yes/no
+    ta3 = na_if_codes(ta3),
+    ta3_new = case_when(
+      ta3 %in% c(1,2) ~ 1,  # current
+      ta3 %in% c(3,4) ~ 0,  # not current (former/never)
+      TRUE ~ NA_real_
+    ),
+    
+    # Tooth loss: m5p_new = 28 - (m5p3 + m5p6)
+    m5p3 = na_if_codes(m5p3),
+    m5p6 = na_if_codes(m5p6),
+    m5p_new = if_else(!is.na(m5p3) & !is.na(m5p6), 28 - (m5p3 + m5p6), NA_real_),
+    
+    # Education
+    as7_1 = na_if_codes(as7_1),
+    as7_new3cat = case_when(
+      is.na(as7_1) ~ NA_character_,
+      as7_1 < 12   ~ "<12",
+      as7_1 == 12  ~ "=12",
+      as7_1 > 12   ~ ">12"
+    ),
+    as7_new_bin = case_when(
+      is.na(as7_1) ~ NA_real_,
+      as7_1 < 12   ~ 0,
+      as7_1 >= 12  ~ 1
+    ),
+    
+    # Waist circumference
+    m4p3 = na_if_codes(m4p3),
+    
+    # Blood pressure: mean of 2nd & 3rd measurements
+    m2p9_1  = na_if_codes(m2p9_1),
+    m2p10_1 = na_if_codes(m2p10_1),
+    m2p9_2  = na_if_codes(m2p9_2),
+    m2p10_2 = na_if_codes(m2p10_2),
+    
+    m2p11a_PAS = {
+      x <- rowMeans(cbind(m2p9_1, m2p10_1), na.rm = TRUE)
+      ifelse(is.nan(x), NA_real_, x)
+    },
+    m2p11a_PAD = {
+      x <- rowMeans(cbind(m2p9_2, m2p10_2), na.rm = TRUE)
+      ifelse(is.nan(x), NA_real_, x)
+    },
+    
+    # Glucose
+    m3p1 = na_if_codes(m3p1)
+  ) %>%
+  mutate(
+    across(any_of(cancer_items), ~ na_if_codes(.x)),
+    
+    # Outcome: cancer history (any of the cancer items == "Yes")
+    m9p_new = case_when(
+      rowSums(across(any_of(cancer_items), ~ (.x == 1)), na.rm = TRUE) > 0 ~ 1,
+      rowSums(!is.na(across(any_of(cancer_items)))) > 0 &
+        rowSums(across(any_of(cancer_items), ~ (.x == 2)), na.rm = TRUE) ==
+        rowSums(!is.na(across(any_of(cancer_items)))) ~ 0,
+      TRUE ~ NA_real_
+    )
+  )
+
+cat("\nQA checks:\n")
+print(table(dat$ta3_new, useNA = "ifany"))
+print(table(dat$m9p_new, useNA = "ifany"))
+
+
+# VII. SVI (Social Vulnerability/Adversity Index) ----
+dat <- dat %>%
+  mutate(
+    n_per = na_if_codes(n_per),
+    as27  = na_if_codes(as27),
+    as27_new = if_else(!is.na(as27) & !is.na(n_per) & n_per > 0, as27 / n_per, NA_real_)
+  )
+
+# 5.1 Income adversity: bottom quintile
+q20_income <- quantile(dat$as27_new, probs = 0.20, na.rm = TRUE)
+dat <- dat %>%
+  mutate(
+    income_depr = case_when(
+      is.na(as27_new) ~ NA_real_,
+      as27_new <= q20_income ~ 1,
+      TRUE ~ 0
+    ),
+    income_index = income_depr
+  )
+
+# 5.2 Education adversity: <12 years
+dat <- dat %>%
+  mutate(
+    educ_depr = case_when(
+      is.na(as7_new_bin) ~ NA_real_,
+      as7_new_bin == 0 ~ 1,
+      as7_new_bin == 1 ~ 0,
+      TRUE ~ NA_real_
+    ),
+    educ_index = educ_depr
+  )
+
+# 5.3 Poverty proxy: low income OR overcrowding >=5
+dat <- dat %>%
+  mutate(
+    overcrowded = case_when(
+      is.na(n_per) ~ NA_real_,
+      n_per >= 5 ~ 1,
+      TRUE ~ 0
+    ),
+    poverty_depr = case_when(
+      is.na(income_depr) & is.na(overcrowded) ~ NA_real_,
+      income_depr == 1 | overcrowded == 1 ~ 1,
+      income_depr == 0 & overcrowded == 0 ~ 0,
+      TRUE ~ NA_real_
+    ),
+    poverty_index = poverty_depr
+  )
+
+# 5.4 Housing adversity (basic services + materials)
+housing_vars <- c("as29","as30","as31","as32","as33","as34","as36","as37","as38","as39")
+dat <- dat %>%
+  mutate(across(any_of(housing_vars), na_if_codes)) %>%
+  mutate(
+    depr_water = case_when(is.na(as29) ~ NA_real_, as29 == 1 ~ 0, TRUE ~ 1),
+    depr_electric = case_when(is.na(as32) ~ NA_real_, as32 == 1 ~ 0, TRUE ~ 1),
+    depr_sanitation = case_when(is.na(as31) ~ NA_real_, as31 == 1 ~ 0, TRUE ~ 1),
+    
+    # NOTE: These codes are placeholders until labels are confirmed.
+    depr_roof  = if_else(is.na(as37), NA_real_, if_else(as37 %in% c(3,4,5,6,7,8,9), 1, 0)),
+    depr_walls = if_else(is.na(as38), NA_real_, if_else(as38 %in% c(3,4,5,6,7,8,9), 1, 0)),
+    depr_floor = if_else(is.na(as39), NA_real_, if_else(as39 %in% c(3,4,5,6,7,8,9), 1, 0)),
+    housing_index = rowSums(across(c(depr_water, depr_electric, depr_sanitation,
+                                     depr_roof, depr_walls, depr_floor)), na.rm = TRUE)
+  )
+
+# 5.5 Composite SVI + 1-SD standardized SVI_z
+dat <- dat %>%
+  mutate(
+    svi_income_z  = zscore(income_index),
+    svi_educ_z    = zscore(educ_index),
+    svi_poverty_z = zscore(poverty_index),
+    svi_housing_z = zscore(housing_index),
+    SVI = rowMeans(cbind(svi_income_z, svi_educ_z, svi_poverty_z, svi_housing_z), na.rm = TRUE),
+    SVI = if_else(is.nan(SVI), NA_real_, SVI),
+    SVI_z = zscore(SVI)
+  )
+
+cat("\nSVI summary:\n")
+print(summary(dat$SVI))
+cat("Missing SVI:", sum(is.na(dat$SVI)), "\n")
+
+
+# VIII. SURVEY DESIGN OBJECT ----
+stopifnot(W_VAR %in% names(dat), PSU_VAR %in% names(dat), STRATA_VAR %in% names(dat))
+
+dat <- dat %>%
+  mutate(
+    w      = as.numeric(na_if_codes(.data[[W_VAR]])),
+    psu    = as.numeric(na_if_codes(.data[[PSU_VAR]])),
+    strata = as.numeric(na_if_codes(.data[[STRATA_VAR]]))
+  ) %>%
+  filter(!is.na(w), w > 0, !is.na(psu), !is.na(strata))
+
+des <- svydesign(ids = ~psu, strata = ~strata, weights = ~w, data = dat, nest = TRUE)
+
+cat("\nDesign checks:\n")
+cat("N (post design filter):", nrow(dat), "\n")
+cat("Unique PSU:", length(unique(dat$psu)), "\n")
+cat("Unique strata:", length(unique(dat$strata)), "\n")
+
+
+
+# IX. COMPLETE-CASE ANALYTIC SAMPLE (core variables)----
+main_vars <- c("m9p_new","SVI_z","Edad","Sexo","cd8","ta3_new","diabetes_m2p6",
+               "m4p3","m2p11a_PAS","m2p11a_PAD","m3p1")
+
+main_vars_exist <- intersect(main_vars, names(dat))
+
+dat_cc <- dat %>%
+  filter(if_all(all_of(main_vars_exist), ~ !is.na(.x))) %>%
+  mutate(
+    group = if_else(m9p_new == 1, "Cancer", "No cancer"),
+    group = factor(group, levels = c("No cancer","Cancer")),
+    
+    Sexo = haven::as_factor(Sexo),
+    ta3_new = factor(ta3_new, levels = c(0,1), labels = c("No","Yes")),
+    diabetes_m2p6 = factor(diabetes_m2p6, levels = c(0,1), labels = c("No","Yes")),
+    as7_new3cat = factor(as7_new3cat, levels = c("<12","=12",">12")),
+    as7_new_bin = factor(as7_new_bin, levels = c(0,1), labels = c("<12","≥12"))
+  )
+
+des_cc <- svydesign(ids = ~psu, strata = ~strata, weights = ~w, data = dat_cc, nest = TRUE)
+des_cc_tbl <- as_survey(des_cc)
+
+cat("\nComplete-case sample:\n")
+cat("N CC:", nrow(dat_cc), "\n")
+print(table(dat_cc$m9p_new))
+
+# X. TABLE 1 — SURVEY-WEIGHTED DESCRIPTIVE STATISTICS----
+w_mean_se <- function(des_tbl, var) {
+  des_tbl %>%
+    group_by(group) %>%
+    summarise(m = survey_mean(.data[[var]], na.rm = TRUE, vartype = "se")) %>%
+    transmute(group, variable = var, level = NA_character_, mean = m, se = m_se)
+}
+
+w_prop_se <- function(des_tbl, var) {
+  x <- des_tbl$variables[[var]]
+  lvls <- sort(unique(x[!is.na(x)]))
+  
+  purrr::map_dfr(lvls, function(lvl) {
+    des_tbl %>%
+      group_by(group) %>%
+      summarise(p = survey_mean(I(.data[[var]] == lvl), na.rm = TRUE, vartype = "se")) %>%
+      transmute(group, variable = var, level = as.character(lvl), prop = p, se = p_se)
+  })
+}
+
+cont_vars <- intersect(c("Edad","SVI","SVI_z","cd8","m4p3","m2p11a_PAS","m2p11a_PAD","m3p1"), names(dat_cc))
+cat_vars  <- intersect(c("Sexo","ta3_new","diabetes_m2p6","as7_new3cat","as7_new_bin"), names(dat_cc))
+
+tab1_cont <- map_dfr(cont_vars, ~ w_mean_se(des_cc_tbl, .x)) %>%
+  mutate(stat = paste0(round(mean, 1), " (SE ", round(se, 2), ")")) %>%
+  select(group, variable, level, stat)
+
+tab1_cat <- map_dfr(cat_vars, ~ w_prop_se(des_cc_tbl, .x)) %>%
+  mutate(pct = 100*prop, se_pct = 100*se,
+         stat = paste0(round(pct, 1), "% (SE ", round(se_pct, 2), ")")) %>%
+  select(group, variable, level, stat)
+
+tab1_wide <- bind_rows(tab1_cont, tab1_cat) %>%
+  mutate(rowname = if_else(is.na(level), variable, paste0(variable, ": ", level))) %>%
+  select(rowname, group, stat) %>%
+  pivot_wider(names_from = group, values_from = stat)
+
+write.xlsx(tab1_wide, file.path(OUT_DIR, "Table1_weighted.xlsx"))
+cat("\nSaved: Table1_weighted.xlsx\n")
+
+
+
+# XI. MODELS ----
+dat_m <- dat_cc %>%
+  mutate(
+    m9p_new_num = as.numeric(m9p_new),
+    PAS10 = m2p11a_PAS / 10,
+    PAD10 = m2p11a_PAD / 10,
+    glu10 = m3p1 / 10
+  )
+
+des_m <- svydesign(ids = ~psu, strata = ~strata, weights = ~w, data = dat_m, nest = TRUE)
+
+# 11.1 Table 2: unweighted LPM (robust SE)
+f_full <- m9p_new_num ~ SVI_z + Edad + Sexo + cd8 + ta3_new + diabetes_m2p6 + m4p3 + PAS10 + PAD10 + glu10
+
+lpm_fit <- lm(f_full, data = dat_m)
+lpm_vcov <- sandwich::vcovHC(lpm_fit, type = "HC1")
+lpm_robust <- lmtest::coeftest(lpm_fit, vcov. = lpm_vcov)
+
+tab2_lpm <- broom::tidy(lpm_robust) %>%
+  mutate(
+    model = "LPM (unweighted, robust SE)",
+    conf.low = estimate - 1.96*std.error,
+    conf.high = estimate + 1.96*std.error
+  ) %>%
+  filter(term != "(Intercept)") %>%
+  select(model, term, estimate, std.error, conf.low, conf.high, p.value)
+
+write.xlsx(tab2_lpm, file.path(OUT_DIR, "Table2_LPM_unweighted_robust.xlsx"))
+cat("Saved: Table2_LPM_unweighted_robust.xlsx\n")
+
+# 11.2 Table 3: survey-weighted PR (Poisson log-link)
+f_min <- m9p_new_num ~ SVI_z + Edad + Sexo
+
+pr_min  <- svyglm(f_min,  design = des_m, family = quasipoisson(link = "log"))
+pr_full <- svyglm(f_full, design = des_m, family = quasipoisson(link = "log"))
+
+tidy_pr <- function(fit, model_name) {
+  broom::tidy(fit) %>%
+    mutate(
+      model = model_name,
+      PR = exp(estimate),
+      PR_low = exp(estimate - 1.96*std.error),
+      PR_high = exp(estimate + 1.96*std.error)
+    ) %>%
+    filter(term != "(Intercept)") %>%
+    select(model, term, PR, PR_low, PR_high, p.value)
+}
+
+tab3_pr <- bind_rows(
+  tidy_pr(pr_min,  "PR (svy Poisson) — minimal"),
+  tidy_pr(pr_full, "PR (svy Poisson) — full")
+)
+
+write.xlsx(tab3_pr, file.path(OUT_DIR, "Table3_PR_svyPoisson.xlsx"))
+cat("Saved: Table3_PR_svyPoisson.xlsx\n")
+
+
+# XII. FIGURES ----
+# 12.0 Create grouped variables for figures
+dat_m <- dat_m %>%
+  mutate(
+    # SVI quintiles for descriptive prevalence plots
+    SVI_for_q = if ("SVI" %in% names(.)) SVI else SVI_z,
+    SVI_quint = if_else(is.na(SVI_for_q), NA_integer_, ntile(SVI_for_q, 5)),
+    SVI_quint = factor(SVI_quint, levels = 1:5, labels = paste0("Q", 1:5)),
+    
+    # Tooth loss categories (optional descriptive)
+    toothloss_cat = case_when(
+      is.na(m5p_new) ~ NA_character_,
+      m5p_new == 0 ~ "0",
+      m5p_new >= 1  & m5p_new <= 4  ~ "1–4",
+      m5p_new >= 5  & m5p_new <= 9  ~ "5–9",
+      m5p_new >= 10 & m5p_new <= 14 ~ "10–14",
+      m5p_new >= 15 ~ "≥15",
+      TRUE ~ NA_character_
+    ),
+    toothloss_cat = factor(toothloss_cat, levels = c("0","1–4","5–9","10–14","≥15"))
+  )
+
+des_m <- svydesign(ids = ~psu, strata = ~strata, weights = ~w, data = dat_m, nest = TRUE)
+
+# 12.1 Weighted prevalence by group
+prev1 <- weighted_prev_by(des_m, "m9p_new_num", "SVI_quint")
+p1 <- svy_chisq_p(des_m, "m9p_new_num", "SVI_quint")
+Fig01 <- plot_weighted_prev(prev1, "Cancer history prevalence by SVI quintiles", p_value = p1)
+save_plot(Fig01, "Fig01_prev_by_SVI_quint.png")
+
+prev2 <- weighted_prev_by(des_m, "m9p_new_num", "toothloss_cat")
+p2 <- svy_chisq_p(des_m, "m9p_new_num", "toothloss_cat")
+Fig02 <- plot_weighted_prev(prev2, "Cancer history prevalence by tooth loss categories", p_value = p2)
+save_plot(Fig02, "Fig02_prev_by_toothloss_cat.png")
+
+if ("diabetes_m2p6" %in% names(dat_m)) {
+  prev3 <- weighted_prev_by(des_m, "m9p_new_num", "diabetes_m2p6")
+  p3 <- svy_chisq_p(des_m, "m9p_new_num", "diabetes_m2p6")
+  Fig03 <- plot_weighted_prev(prev3, "Cancer history prevalence by diabetes (self-report)", p_value = p3)
+  save_plot(Fig03, "Fig03_prev_by_diabetes.png")
+}
+
+# 12.2 Forest plots for PR models (same as Table 3)
+Fig10 <- plot_svyglm_pr_forest(pr_min,  "Survey-weighted PR (minimal): SVI_z + age + sex")
+save_plot(Fig10, "Fig10_PR_forest_minimal.png")
+
+Fig11 <- plot_svyglm_pr_forest(pr_full, "Survey-weighted PR (full): + cd8 + smoking + diabetes + waist + BP + glucose")
+save_plot(Fig11, "Fig11_PR_forest_full.png")
+
+# 12.3 PR curve: cancer history vs tooth loss (weighted PR model)
+fit_pr_tooth_w <- svyglm(m9p_new_num ~ m5p_new, design = des_m, family = quasipoisson(link = "log"))
+tt <- summary(fit_pr_tooth_w)$coefficients
+beta <- tt["m5p_new", "Estimate"]; se_b <- tt["m5p_new", "Std. Error"]; pval <- tt["m5p_new", "Pr(>|t|)"]
+
+pr1 <- exp(beta); pr1_l <- exp(beta - 1.96*se_b); pr1_u <- exp(beta + 1.96*se_b)
+pr5 <- exp(5*beta); pr5_l <- exp(5*(beta - 1.96*se_b)); pr5_u <- exp(5*(beta + 1.96*se_b))
+
+subtitle_w <- paste0(
+  "β = ", round(beta, 3), " (SE ", round(se_b, 3), "), p = ", signif(pval, 3),
+  " | PR per 1 tooth = ", round(pr1, 2), " [", round(pr1_l, 2), "–", round(pr1_u, 2), "]",
+  " | PR per 5 teeth = ", round(pr5, 2), " [", round(pr5_l, 2), "–", round(pr5_u, 2), "]"
+)
+
+x_seq <- seq(min(des_m$variables$m5p_new, na.rm=TRUE), max(des_m$variables$m5p_new, na.rm=TRUE), by = 1)
+Fig20 <- plot_pr_curve(beta = coef(fit_pr_tooth_w),
+                       V = vcov(fit_pr_tooth_w),
+                       x_seq = x_seq,
+                       baseline_x = min(x_seq),
+                       title = "Survey-weighted PR vs tooth loss",
+                       subtitle = subtitle_w)
+save_plot(Fig20, "Fig20_PR_curve_toothloss_weighted.png")
+
+# 12.4 PR curve: unweighted PR (Poisson robust)
+df_unw <- dat_m %>%
+  select(m9p_new_num, m5p_new) %>%
+  filter(!is.na(m9p_new_num), !is.na(m5p_new))
+
+fit_pr_tooth_u <- glm(m9p_new_num ~ m5p_new, data = df_unw, family = poisson(link = "log"))
+Vrob <- sandwich::vcovHC(fit_pr_tooth_u, type = "HC1")
+ct <- lmtest::coeftest(fit_pr_tooth_u, vcov. = Vrob)
+
+beta_u <- ct["m5p_new","Estimate"]; se_u <- ct["m5p_new","Std. Error"]; p_u <- ct["m5p_new","Pr(>|z|)"]
+pr1_u_ <- exp(beta_u); pr1_l_ <- exp(beta_u - 1.96*se_u); pr1_h_ <- exp(beta_u + 1.96*se_u)
+
+subtitle_u <- paste0(
+  "β = ", round(beta_u, 3), " (robust SE ", round(se_u, 3), "), p = ", signif(p_u, 3),
+  " | PR per 1 tooth = ", round(pr1_u_, 2), " [", round(pr1_l_, 2), "–", round(pr1_h_, 2), "]"
+)
+
+Fig21 <- plot_pr_curve(beta = coef(fit_pr_tooth_u),
+                       V = Vrob,
+                       x_seq = seq(min(df_unw$m5p_new), max(df_unw$m5p_new), by = 1),
+                       baseline_x = min(df_unw$m5p_new),
+                       title = "Unweighted PR vs tooth loss (Poisson robust)",
+                       subtitle = subtitle_u)
+save_plot(Fig21, "Fig21_PR_curve_toothloss_unweighted.png")
+
+cat("\nFigures saved in:", FIG_DIR, "\n")
+
+
+
+# XIII. OPTIONAL: ADD ETHNICITY (Yes/No) TO MODELS ----
+# This section is intentionally “safe-by-default”: it searches candidate columns
+# and does not assume variable names. Uncomment and adapt once confirmed.
+
+# cand_eth <- grep("etn|etni|indig|pueblo|origin|mapu|ayma|rapa|quech|diagui|kolla|kawes|yagan",
+#                  names(dat_m), ignore.case = TRUE, value = TRUE)
+# print(cand_eth)
+# v_eth <- cand_eth[1]  # <- choose the correct one
+# table(dat_m[[v_eth]], useNA="ifany")
+#
+# dat_m <- dat_m %>%
+#   mutate(
+#     ethnicity_yesno = case_when(
+#       .data[[v_eth]] == 1 ~ "Yes",
+#       .data[[v_eth]] == 2 ~ "No",
+#       TRUE ~ NA_character_
+#     ),
+#     ethnicity_yesno = factor(ethnicity_yesno, levels = c("No","Yes"))
+#   )
+#
+# des_m <- svydesign(ids=~psu, strata=~strata, weights=~w, data=dat_m, nest=TRUE)
+# pr_full_eth <- svyglm(update(f_full, . ~ . + ethnicity_yesno),
+#                       design = des_m, family = quasipoisson(link="log"))
+# summary(pr_full_eth)
+
+
+
+# XIV. SAVE SESSION INFO ----==================================
+sink(file.path(OUT_DIR, "sessionInfo.txt"))
+print(sessionInfo())
+sink()
+cat("\nDone. Outputs in:", OUT_DIR, "\n")
